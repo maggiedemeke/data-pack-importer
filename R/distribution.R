@@ -128,7 +128,7 @@ distributeSite <- function(d) {
   organisationunituid<-NULL
   name<-NULL
   
-  #Not sure what to do with this. I think we should exlcude them. 
+  
         militaryUnits<-datapackimporter::militaryUnits
   #Default distribution is 2018 if not otherwise specified
       if (d$wb_info$distribution_method == 2017) {
@@ -137,33 +137,68 @@ distributeSite <- function(d) {
         file_name = "distrSiteFY18.rda"
       } else
       {
-        stop("Distribution year must either 2017 or 2018! ")
+        stop("Distribution year must be either 2017 or 2018! ")
       }
   
-  file_path = paste0(d$wb_info$support_files_path, file_name)
+  file_path = paste0(d$wb_info$support_files_path
+                #Account for cases where support_files_path might have omitted final '/'
+                     ,ifelse(stringr::str_detect(d$wb_info$support_files_path,"\\/$"),"","/")
+                     ,file_name)
+  
   
   if (!file.exists(file_path)) {
     stop(paste("Distribution file could not be found. Please check it exists at",file_path))
   }
   
-  Pcts<-readRDS( file = file_path )
+  #Setup Follow-on Mechs map to join using either code or uid
+      follow_ons<- d$follow_on_mechs %>%
+          dplyr::select(Closing.Out=`Closing Out`, Follow.On=`Follow on`,Notes) %>%
+          dplyr::mutate(Closing.Out=as.character(Closing.Out),Follow.On=as.character(Follow.On)) %>%
+          dplyr::left_join(mechs,by=c("Closing.Out"="code")) %>%
+          dplyr::mutate(Closing.Out.uid=uid) %>%
+          dplyr::select(-uid) %>%
+          dplyr::left_join(mechs,by=c("Follow.On"="code")) %>%
+          dplyr::mutate(Follow.On.uid=uid) %>%
+          dplyr::select(Closing.Out,Closing.Out.uid,Follow.On,Follow.On.uid,Notes) %>%
+          dplyr::filter(Notes!="example")
+ 
+  
+  Pcts<-readRDS( file = file_path ) %>%
+      #Filter by ou_uid
+        dplyr::filter(uidlevel3==d$wb_info$ou_uid) %>%
+      #Map follow-on mechanisms
+        dplyr::mutate(attributeoptioncombo=stringr::str_extract(whereWhoWhatHuh,"(?<=\\.)\\w{11}")) %>%
+        dplyr::left_join(follow_ons,by=c("attributeoptioncombo"="Closing.Out.uid")) %>%
+        dplyr::select(-Closing.Out,-Follow.On,-Notes) %>%
+        dplyr::mutate(whereWhoWhatHuh=case_when(!is.na(Follow.On.uid)~str_replace(whereWhoWhatHuh,paste0("(?<=^\\w{11}\\.)",attributeoptioncombo),Follow.On.uid),
+                                                TRUE~whereWhoWhatHuh)) %>%
+        dplyr::select(uidlevel3,whereWhoWhatHuh,orgUnit,sitePct)
+  
+  
   de_map<-datapackimporter::rCOP18deMapT %>%
     dplyr::select(supportType,pd_2019_S,pd_2019_P,DataPackCode) %>%
     na.omit() %>%
     dplyr::distinct()
   
     ds <- d$data %>%
-        #Create id to link to percent distributions
+      #Create id to link to percent distributions
         dplyr::mutate(whereWhoWhatHuh=paste(orgunit,attributeoptioncombo,dataelement,categoryoptioncombo,sep=".")) %>%
-        #Pull in distribution percentages, keeping all data
+      #Pull in distribution percentages, keeping all data
         dplyr::left_join(Pcts,by=c("whereWhoWhatHuh")) %>%
-       #Do we need to round or what here?
-        dplyr::mutate(value = round_trunc(as.numeric(value) * sitePct)) %>%
-      #Don't we have to remap back to the Site level data elements from the PSNU data elements?
-        dplyr::select(dataelement,period,orgunit=orgUnit,categoryoptioncombo,attributeoptioncombo,value) %>%
+      #Do we need to round or what here?
+        dplyr::mutate(value = case_when(!is.na(sitePct)~round_trunc(as.numeric(value) * sitePct)
+                                #@jason-p-pickering: Should we keep un-distributable values as doubles
+                                    #(as received from Data Pack), or coerce to integer?
+                                        ,TRUE~round_trunc(as.numeric(value)))) %>%
+        #@jason-p-pickering: Opting to NOT drop zero values at this point, but to pass them to Site Level Tool
+            #in the name of transparency. These function as evidence of rounding of very small values which may
+            #need to be addressed manually in Site Level Tool.
+      #Mapping from PSNU data elements to site level data elements can wait until after receipt from Site Level Tool
+        dplyr::select(dataelement,period,DPorgunit=orgunit,orgunit=orgUnit,categoryoptioncombo,attributeoptioncombo,value) %>%
+      #Map to Data Pack Codes for use in Site Level Tool
         dplyr::mutate(pd_2019_P=paste0(`dataelement`,".",`categoryoptioncombo`)) %>%
         dplyr::left_join(de_map,by=c("pd_2019_P")) %>%
-        dplyr::select(orgunit,attributeoptioncombo,supportType,DataPackCode,value) 
+        dplyr::select(DPorgunit,orgunit,attributeoptioncombo,supportType,DataPackCode,value)
         # dplyr::left_join(mechs,by=c("attributeoptioncombo")) %>%
         # dplyr::left_join(ous_with_psnus,by=c("orgunit"="organisationunituid")) %>%
         # dplyr::mutate(site = paste(psnu_name,">",name,"(",orgunit,")")) %>%
@@ -180,6 +215,10 @@ distributeSite <- function(d) {
     
     sites<-readRDS(paste0(d$wb_info$support_files_path,"ous_with_psnus.rds")) %>%
       dplyr::filter(ou_name == d$wb_info$ou_name) %>%
+    #@jason-p-pickering: We'll need to alter this to include _Military SNU1s as options as well.
+    #@jason-p-pickering: Also need to alter this list to allow us to address undistributable cases from above.
+        #In these cases, data should remain at the PSNU or Cluster level as "PSNU A > NOT YET DISTRIBUTED" 
+        #or "Cluster A > NOT YET DISTRIBUTED".
       dplyr::filter(!(psnu_name =="" | is.na(psnu_name))) %>%
       dplyr::select(organisationunituid,name,psnu_name)
     
